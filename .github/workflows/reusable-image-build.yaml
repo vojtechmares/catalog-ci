@@ -1,0 +1,157 @@
+# Reusable workflow: build, publish, sign and scan a container image.
+#
+# Builds a multi-arch image with Buildx, pushes it to the OCI registry,
+# generates SBOM and provenance attestations, signs the image with cosign
+# (keyless / OIDC) and scans it with Trivy.
+#
+# Call it from an image repository, typically from a matrix over changed
+# image directories:
+#
+#   jobs:
+#     build:
+#       permissions:
+#         contents: read
+#         id-token: write   # required for cosign keyless signing
+#       uses: vojtechmares/catalog-ci/.github/workflows/reusable-image-build.yaml@main
+#       with:
+#         image: nginx
+#         context: nginx
+#         version: "1.27.3"
+#       secrets:
+#         registry-username: ${{ secrets.REGISTRY_USERNAME }}
+#         registry-password: ${{ secrets.REGISTRY_PASSWORD }}
+name: reusable-image-build
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Image name (last path segment in the registry).
+        type: string
+        required: true
+      context:
+        description: Build context directory.
+        type: string
+        required: true
+      dockerfile:
+        description: Path to the Dockerfile, relative to the repository root.
+        type: string
+        default: ""
+      version:
+        description: Upstream/app version, used as the primary image tag.
+        type: string
+        required: true
+      registry:
+        description: OCI registry host to publish the image to.
+        type: string
+        default: registry.mareshq.com
+      image-repo:
+        description: Repository path within the registry (image name is appended).
+        type: string
+        default: catalog/images
+      platforms:
+        description: Comma-separated list of target platforms.
+        type: string
+        default: linux/amd64,linux/arm64
+      push:
+        description: Push the image. Set to false for build-only PR validation.
+        type: boolean
+        default: true
+      sign:
+        description: Sign the pushed image with cosign (keyless).
+        type: boolean
+        default: true
+      scan:
+        description: Scan the image with Trivy.
+        type: boolean
+        default: true
+      scan-severity:
+        description: Trivy severities that fail the build.
+        type: string
+        default: HIGH,CRITICAL
+      scan-exit-code:
+        description: Trivy exit code on findings (set to 0 to report without failing).
+        type: string
+        default: "1"
+    secrets:
+      registry-username:
+        description: Username for the OCI registry.
+        required: false
+      registry-password:
+        description: Password or token for the OCI registry.
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # cosign keyless signing
+    env:
+      IMAGE_REF: ${{ inputs.registry }}/${{ inputs.image-repo }}/${{ inputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install cosign
+        if: inputs.push && inputs.sign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Log in to the registry
+        if: inputs.push
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ secrets.registry-username }}
+          password: ${{ secrets.registry-password }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_REF }}
+          tags: |
+            type=raw,value=${{ inputs.version }}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: ${{ inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: ${{ inputs.push }}
+          sbom: ${{ inputs.push }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Sign image
+        if: inputs.push && inputs.sign
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE_REF}@${DIGEST}"
+
+      - name: Scan image with Trivy
+        if: inputs.push && inputs.scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE_REF }}@${{ steps.build.outputs.digest }}
+          format: table
+          severity: ${{ inputs.scan-severity }}
+          exit-code: ${{ inputs.scan-exit-code }}
+          ignore-unfixed: "true"

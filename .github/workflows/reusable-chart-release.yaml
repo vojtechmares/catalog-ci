@@ -1,0 +1,126 @@
+# Reusable workflow: package, publish and sign Helm charts as OCI artifacts.
+#
+# The release is idempotent and driven by the `version` field in each
+# Chart.yaml: for every chart whose `name:version` does not yet exist in the
+# registry, the chart is packaged, pushed to the OCI registry and signed with
+# cosign (keyless / OIDC). Bumping the chart version is what triggers a release.
+#
+# Call it from a chart repository on pushes to the default branch:
+#
+#   jobs:
+#     release:
+#       permissions:
+#         contents: read
+#         id-token: write   # required for cosign keyless signing
+#       uses: vojtechmares/catalog-ci/.github/workflows/reusable-chart-release.yaml@main
+#       with:
+#         registry: registry.mareshq.com
+#         oci-repo: catalog/charts
+#       secrets:
+#         registry-username: ${{ secrets.REGISTRY_USERNAME }}
+#         registry-password: ${{ secrets.REGISTRY_PASSWORD }}
+name: reusable-chart-release
+
+on:
+  workflow_call:
+    inputs:
+      charts-dir:
+        description: Directory that holds the charts (one sub-directory per chart).
+        type: string
+        default: charts
+      registry:
+        description: OCI registry host to publish charts to.
+        type: string
+        default: registry.mareshq.com
+      oci-repo:
+        description: Repository path within the registry (chart name is appended).
+        type: string
+        default: catalog/charts
+      helm-version:
+        description: Helm version to install.
+        type: string
+        default: v3.16.3
+      sign:
+        description: Sign published charts with cosign (keyless).
+        type: boolean
+        default: true
+    secrets:
+      registry-username:
+        description: Username for the OCI registry.
+        required: true
+      registry-password:
+        description: Password or token for the OCI registry.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # cosign keyless signing
+    env:
+      REGISTRY: ${{ inputs.registry }}
+      OCI_REPO: ${{ inputs.oci-repo }}
+      CHARTS_DIR: ${{ inputs.charts-dir }}
+      SIGN: ${{ inputs.sign }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: ${{ inputs.helm-version }}
+
+      - name: Install cosign
+        if: inputs.sign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Log in to the registry
+        env:
+          REGISTRY_USERNAME: ${{ secrets.registry-username }}
+          REGISTRY_PASSWORD: ${{ secrets.registry-password }}
+        run: |
+          echo "$REGISTRY_PASSWORD" | helm registry login "$REGISTRY" \
+            --username "$REGISTRY_USERNAME" --password-stdin
+
+      - name: Package, push and sign changed charts
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          published=0
+          for dir in "$CHARTS_DIR"/*/; do
+            [ -f "$dir/Chart.yaml" ] || continue
+            name="$(yq '.name' "$dir/Chart.yaml")"
+            version="$(yq '.version' "$dir/Chart.yaml")"
+
+            if helm show chart "oci://$REGISTRY/$OCI_REPO/$name" --version "$version" >/dev/null 2>&1; then
+              echo "::notice::$name:$version already published, skipping"
+              continue
+            fi
+
+            echo "::group::Releasing $name:$version"
+            helm dependency update "$dir"
+            helm package "$dir" --destination .cr-release
+
+            push_output="$(helm push ".cr-release/$name-$version.tgz" "oci://$REGISTRY/$OCI_REPO" 2>&1)"
+            echo "$push_output"
+            digest="$(echo "$push_output" | awk '/[Dd]igest:/ {print $NF}')"
+
+            if [ "$SIGN" = "true" ]; then
+              if [ -z "$digest" ]; then
+                echo "::error::could not determine digest for $name:$version, refusing to sign by tag"
+                exit 1
+              fi
+              cosign sign --yes "$REGISTRY/$OCI_REPO/$name@$digest"
+              echo "::notice::signed $name:$version ($digest)"
+            fi
+            echo "::endgroup::"
+            published=$((published + 1))
+          done
+          echo "::notice::published $published chart(s)"

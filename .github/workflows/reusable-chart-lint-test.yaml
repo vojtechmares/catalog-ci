@@ -1,0 +1,94 @@
+# Reusable workflow: lint and test Helm charts.
+#
+# Runs `ct lint` against changed charts, then spins up an ephemeral kind
+# cluster and runs `ct install` to verify the charts actually deploy.
+#
+# Call it from a chart repository on pull requests:
+#
+#   jobs:
+#     lint-test:
+#       uses: vojtechmares/catalog-ci/.github/workflows/reusable-chart-lint-test.yaml@main
+#       with:
+#         charts-dir: charts
+name: reusable-chart-lint-test
+
+on:
+  workflow_call:
+    inputs:
+      charts-dir:
+        description: Directory that holds the charts (one sub-directory per chart).
+        type: string
+        default: charts
+      ct-config:
+        description: Path to the chart-testing (ct) config file.
+        type: string
+        default: ct.yaml
+      target-branch:
+        description: Branch to diff against when detecting changed charts.
+        type: string
+        default: main
+      helm-version:
+        description: Helm version to install.
+        type: string
+        default: v3.16.3
+      kubernetes-version:
+        description: Kubernetes version for the kind test cluster (kind node image tag).
+        type: string
+        default: v1.31.2
+      run-install:
+        description: Whether to run `ct install` on an ephemeral kind cluster.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: ${{ inputs.helm-version }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+          check-latest: true
+
+      - name: Set up chart-testing
+        uses: helm/chart-testing-action@v2
+
+      - name: Detect changed charts
+        id: list-changed
+        run: |
+          changed="$(ct list-changed --config "${{ inputs.ct-config }}" --target-branch "${{ inputs.target-branch }}")"
+          if [ -n "$changed" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Changed charts:"
+            echo "$changed"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No charts changed."
+          fi
+
+      - name: Lint charts
+        if: steps.list-changed.outputs.changed == 'true'
+        run: ct lint --config "${{ inputs.ct-config }}" --target-branch "${{ inputs.target-branch }}"
+
+      - name: Create kind cluster
+        if: steps.list-changed.outputs.changed == 'true' && inputs.run-install
+        uses: helm/kind-action@v1
+        with:
+          node_image: kindest/node:${{ inputs.kubernetes-version }}
+
+      - name: Install charts
+        if: steps.list-changed.outputs.changed == 'true' && inputs.run-install
+        run: ct install --config "${{ inputs.ct-config }}" --target-branch "${{ inputs.target-branch }}"

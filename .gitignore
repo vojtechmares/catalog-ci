@@ -1,0 +1,11 @@
+# Chart release working directory
+.cr-release/
+.cr-release-packages/
+.cr-index/
+
+# Tools downloaded in CI
+actionlint
+
+# OS / editor
+.DS_Store
+*.swp
